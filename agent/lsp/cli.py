@@ -133,10 +133,34 @@ def _cmd_list(installed_only: bool) -> int:
     return 0
 
 
+def _repair_extra_pkgs(pkg: str) -> bool:
+    """Ensure a recipe's ``extra_pkgs`` (the SDK half) are present in the staging tree.
+
+    ``detect_status`` only probes the server **binary**, so a staged-but-SDK-less install
+    (e.g. ``typescript`` resolved to 7.x — the Go port, which ships no ``lib/typescript.js``)
+    reports ``installed`` while the language server refuses to start diagnostics.  Reinstalling
+    the recipe's own packages repairs exactly that half without touching the binary.
+    Returns True when an install actually ran.
+    """
+    from agent.lsp.install import INSTALL_RECIPES, try_install
+
+    recipe = INSTALL_RECIPES.get(pkg) or {}
+    extra = list(recipe.get("extra_pkgs") or [])
+    if not extra:
+        return False
+    return try_install(pkg, "auto") is not None
+
+
 def _cmd_install(server_id: str) -> int:
     from agent.lsp.install import try_install, INSTALL_RECIPES
     pkg = _recipe_pkg_for(server_id)
     if _status_for(server_id) == "installed":
+        # The status only covers the server binary; recipes that also need a sibling SDK
+        # (extra_pkgs) must still be repaired here — otherwise a binary-only staging tree
+        # keeps reporting "already installed" while the server cannot resolve its SDK.
+        if _repair_extra_pkgs(pkg):
+            sys.stdout.write(f"{server_id} already installed — SDK (extra_pkgs) repaired\n")
+            return 0
         sys.stdout.write(f"{server_id} already installed\n")
         return 0
     sys.stdout.write(f"installing {server_id} (pkg={pkg}) ...\n")
@@ -161,7 +185,11 @@ def _cmd_install_all(include_manual: bool) -> int:
         if recipe is None or (recipe.get("strategy") == "manual" and not include_manual):
             continue
         if _status_for(s.server_id) == "installed":
-            sys.stdout.write(f"  {s.server_id:24s} already installed\n")
+            # Same SDK gap as _cmd_install: a binary-only staging tree must still be repaired.
+            if _repair_extra_pkgs(pkg):
+                sys.stdout.write(f"  {s.server_id:24s} already installed — SDK repaired\n")
+            else:
+                sys.stdout.write(f"  {s.server_id:24s} already installed\n")
             continue
         sys.stdout.write(f"  installing {s.server_id} (pkg={pkg}) ... ")
         sys.stdout.flush()

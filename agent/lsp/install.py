@@ -166,7 +166,16 @@ def _do_install(pkg: str) -> Optional[str]:
     strategy = recipe.get("strategy", "manual")
     bin_name = recipe.get("bin", pkg)
     if existing := _existing_binary(bin_name):
-        return existing
+        # A present binary is NOT proof the install is complete: recipes with ``extra_pkgs``
+        # (the sibling SDK, e.g. ``typescript@6`` for typescript-language-server) can be
+        # staged binary-only — the server then starts but resolves no SDK and publishes no
+        # diagnostics.  Repair that half instead of returning the binary untouched.
+        if not recipe.get("extra_pkgs") or strategy != "npm":
+            return existing
+        if _extra_pkgs_present(recipe):
+            return existing
+        logger.info("[install] %s: binary present but extra_pkgs %s missing — repairing",
+                    pkg, recipe.get("extra_pkgs"))
     if strategy == "manual":
         logger.debug("[install] %s requires manual install (recipe=%s)", pkg, recipe)
         return None
@@ -175,6 +184,32 @@ def _do_install(pkg: str) -> Optional[str]:
         logger.warning("[install] unknown strategy %r for %s", strategy, pkg)
         return None
     return installer(recipe, bin_name)
+
+
+def _extra_pkgs_present(recipe: Dict[str, Any]) -> bool:
+    """True when every ``extra_pkgs`` entry is resolvable from the staging node_modules.
+
+    The tree is the one ``_install_npm`` installs into (``hermes_lsp_bin_dir().parent``), so
+    this asks the same question the TypeScript SDK locator asks at spawn time — and must fail
+    for the Go port (TypeScript 7 ships no ``lib/typescript.js``).
+    """
+    import json
+
+    staging = hermes_lsp_bin_dir().parent / "node_modules"
+    for spec in recipe.get("extra_pkgs") or []:
+        # Recipe specs are ``name`` or ``name@range``; strip the range for the directory name.
+        name = spec.split("@", 1)[0] if not spec.startswith("@") else "@" + spec[1:].split("@", 1)[0]
+        pkg_dir = staging / name
+        if not (pkg_dir / "package.json").is_file():
+            return False
+        if name == "typescript" and not (pkg_dir / "lib" / "typescript.js").is_file():
+            return False  # Go port (7.x): package present, SDK entry missing
+        try:
+            with open(pkg_dir / "package.json", encoding="utf-8") as fh:
+                json.load(fh)
+        except (OSError, ValueError):
+            return False
+    return True
 
 
 def _run_installer(tool: str, pkg: str, cmd: list, *, timeout: int, env: Optional[dict] = None) -> bool:
